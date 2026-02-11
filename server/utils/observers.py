@@ -89,7 +89,10 @@ class PipelineLogObserver(BaseObserver):
 
             # Accumulate and log LLM response from LLM service
             # Use LLMTextFrame (not TextFrame) - this is what LLM services output
-            case (LLMFullResponseStartFrame(), LLMService()):
+            case (LLMFullResponseStartFrame(), LLMService() as llm_service):
+                service_name = type(llm_service).__name__
+                model_name = getattr(llm_service, "model_name", "unknown")
+                logger.info(f"LLM processing with {service_name} (model: {model_name})")
                 self._llm_accumulator = ""
                 self._is_accumulating = True
 

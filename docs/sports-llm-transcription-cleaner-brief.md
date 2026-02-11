@@ -300,3 +300,112 @@ This pipeline reuses the proven architecture from Tambourine's dictation cleaner
 6. **Bypassable** — raw fallback if the LLM is slow or down
 
 The result: an announcer says "judge hits a dinger to left," and within 1-2 seconds the downstream system receives "Judge hits a dinger to left." — correctly capitalized, roster-matched, and cleaned.
+
+---
+
+## Testing Learnings (Feb 2026)
+
+Initial integration testing against Tambourine's pipeline with custom baseball broadcast prompts surfaced several issues. These findings should inform the next iteration of the design.
+
+### 1. Turn Detection Is the Biggest Bottleneck
+
+**Problem:** The user had to manually press "stop recording" to end each turn. After stop-recording, the system enters a WaitingForSTT state and falls back to a **1.5-second timeout every single time** because the VAD speech-stopped signal never arrives in time. This adds 1.5s of dead time to every turn before the LLM even starts.
+
+**Evidence:**
+```
+16:40:26.841 | Stop-recording received, waiting for STT to finalize
+16:40:28.341 | Timeout waiting for speech stopped after 1.5s  ← always hits
+16:40:28.466 | LLM processing starts
+```
+
+**Root cause:** The current turn detection relies on the user pressing stop, then waits for a VAD signal that never comes (likely because audio stops immediately when recording stops). The timeout is the only exit path.
+
+**Impact on latency budget:**
+| Stage | Brief Target | Actual Measured |
+|---|---|---|
+| Manual stop + STT timeout | 200-300 ms | **1,500 ms** (always hits ceiling) |
+| LLM inference | 100-400 ms | **700-1,300 ms** |
+| **Total (stop → cleaned text)** | **600-1,200 ms** | **2,200-2,900 ms** |
+
+**Possible mitigations:**
+- For live broadcast, automatic turn detection via VAD silence threshold (e.g., 500ms of silence = end of utterance) would eliminate the manual stop requirement entirely.
+- Reduce the STT timeout from 1.5s to something shorter (e.g., 300-500ms) since the VAD signal never arrives anyway — the timeout is effectively the turn-end delay.
+- Investigate why VADUserStoppedSpeakingFrame doesn't fire in WaitingForSTTState — may be a timing issue with audio stream cutoff.
+
+### 2. LLM Inference Is Slower Than Projected
+
+**Problem:** The brief projected 100-200ms TTFB for Cerebras, but measured inference (TTFB + full generation) on `gpt-oss-120b` was **700ms-1,300ms** per turn.
+
+**Likely causes:**
+- The three-section prompt (main + dictionary + advanced) is significantly larger than the brief's ~600-900 token estimate. The baseball prompts include formatting examples, disambiguation tables, backtrack correction rules, and announcement templates.
+- `gpt-oss-120b` is a 120B parameter model — fast by cloud standards, but not as fast as the smaller `llama3.1-8b` would be for this use case.
+- The brief's 100-200ms figure was TTFB only; total generation time for a cleaned sentence adds more.
+
+**Action items:**
+- Benchmark `llama3.1-8b` on Cerebras — smaller model, faster inference, may be sufficient for transcription cleaning.
+- Measure actual prompt token count and trim aggressively. The advanced prompt (backtrack corrections, extra templates) may not justify its token cost.
+- Profile TTFB vs. generation time separately to understand where the time goes.
+
+### 3. Name Disambiguation Is Unreliable (~50% Accuracy)
+
+**Problem:** Two test roster players with similar-sounding names — **John Smith (#22, SS)** and **Jon Smyth (#24, RF)** — were disambiguated correctly only about half the time, despite an explicit disambiguation table in the dictionary prompt.
+
+**Test results:**
+| Raw STT Input | Expected Output | Actual Output | Correct? |
+|---|---|---|---|
+| "number 22 John Smith" | #22 John Smith | #22 John Smith | Yes |
+| "number 24 John Smith" | #24 Jon Smyth | #24 John Smith | **No** |
+| "number 24 Smith" | #24 Jon Smyth | #24 Jon Smyth | Yes |
+
+**Analysis:** When the STT outputs a name that exactly matches one roster player ("John Smith") but the jersey number matches a different player (#24 → Jon Smyth), the LLM faces a conflict. The prompt says to use jersey number to disambiguate, but the LLM sometimes anchors on the literal name match instead. This only fails when the STT confidently outputs the wrong player's exact name — when the STT outputs just a last name ("Smith"), disambiguation works.
+
+**Possible mitigations:**
+- Strengthen the disambiguation instruction with more explicit priority ordering: "Jersey number ALWAYS takes priority over name spelling when they conflict."
+- Add a negative example to the prompt showing this exact failure case.
+- Consider a two-pass approach: first resolve jersey number to a player, then use that player's name regardless of what STT transcribed.
+
+### 4. Avoid "Thinking" Models (Qwen 3)
+
+**Problem:** `qwen-3-32b` on Cerebras is a chain-of-thought model that outputs `<think>` reasoning blocks before the actual response. These thinking tokens are included in the cleaned text output, making it unusable.
+
+**Evidence:**
+```
+Cleaned text: '<think>
+Okay, let's see. The user provided a raw transcription and wants it cleaned...
+[~200 tokens of reasoning]
+</think>
+
+Testing. One. Two three. Mic check. 123. Oh'
+```
+
+**Impact:** The thinking adds ~200+ tokens of latency and pollutes the output. Even if we stripped the `<think>` tags post-hoc, the extra generation time defeats the purpose of a fast inference provider.
+
+**Rule:** Only use non-thinking (non-CoT) models for this pipeline. Stick to `gpt-oss-120b` or `llama3.1-8b` on Cerebras. If using other providers, verify the model doesn't default to chain-of-thought output.
+
+### 5. Garbled Late STT Transcriptions
+
+**Problem:** After stop-recording, a late transcription arrived with garbled content: `"Third rash under breast. I mean"`. This appears to be the STT engine misrecognizing ambient noise or mic artifacts as the audio stream closes.
+
+**Impact:** The garbled text was concatenated into the LLM input. The "I mean" backtrack correction rule in the advanced prompt did work (the LLM dropped the correction phrase), but the garbled prefix was a wasted STT/LLM cycle.
+
+**Possible mitigations:**
+- Shorter draining timeout to reduce the window for garbled late arrivals.
+- Minimum transcription confidence threshold to reject low-quality late frames.
+
+### Updated Latency Budget (Realistic)
+
+| Stage | Original Target | Measured Reality | Notes |
+|---|---|---|---|
+| STT final delivery | 300-500 ms | ~4-5s from speech start | Includes user speaking time; final arrives quickly after speech ends |
+| Turn detection overhead | 200-300 ms | **1,500 ms** | Timeout always fires; VAD signal never arrives |
+| LLM TTFB + generation | 100-400 ms | **700-1,300 ms** | gpt-oss-120b with full 3-section prompt |
+| TCP write | < 10 ms | N/A | Not yet tested |
+| **Total (stop → cleaned)** | **600-1,200 ms** | **2,200-2,900 ms** | ~2x over budget |
+
+### Priority Actions
+
+1. **Reduce turn detection dead time** — lower STT timeout or fix VAD signal propagation.
+2. **Benchmark smaller models** — `llama3.1-8b` may hit the latency target where `gpt-oss-120b` doesn't.
+3. **Trim prompt tokens** — measure actual token count, cut what doesn't earn its latency cost.
+4. **Strengthen name disambiguation** — add explicit priority rules and negative examples.
+5. **Avoid thinking models** — `qwen-3-32b` and similar CoT models are incompatible with this pipeline.

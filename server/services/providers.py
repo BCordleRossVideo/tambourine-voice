@@ -100,10 +100,13 @@ def _create_llm_service_from_config(
     kwargs = config.credential_mapper.map_credentials(settings)
     kwargs.update(config.default_kwargs)
 
-    logger.info(f"Creating LLM service: {config.provider_id.value}")
-
     # Direct instantiation - service_class is type-checked at import time
-    return config.service_class(**kwargs)
+    service = config.service_class(**kwargs)
+
+    model_name = getattr(service, "model_name", "unknown")
+    logger.info(f"Creating LLM service: {config.provider_id.value} (model: {model_name})")
+
+    return service
 
 
 def create_stt_service(provider_id: STTProviderId, settings: "Settings") -> STTService:
