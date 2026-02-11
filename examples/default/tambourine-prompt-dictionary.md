@@ -24,3 +24,9 @@ After each correction, verify that the replacement was applied accurately and th
 - Claude
 - Pipecat
 - Tauri
+- Ross Video
+- Ultrix
+- Carbonite
+- #22 John Smith
+- #24 Jon Smyth
+- 

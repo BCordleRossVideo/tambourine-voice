@@ -319,7 +319,13 @@ LLM_PROVIDERS: Final[dict[LLMProviderId, LLMProviderConfig]] = {
         provider_id=LLMProviderId.CEREBRAS,
         display_name="Cerebras",
         service_class=CerebrasLLMService,
-        credential_mapper=ApiKeyMapper("cerebras_api_key"),
+        credential_mapper=MultiFieldMapper(
+            {
+                "cerebras_api_key": "api_key",
+                "cerebras_model": "model",
+            },
+            required_fields=("cerebras_api_key",),
+        ),
         default_kwargs={"retry_on_timeout": True, "retry_timeout_secs": 10.0},
     ),
     LLMProviderId.GEMINI: LLMProviderConfig(
