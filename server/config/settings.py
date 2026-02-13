@@ -47,9 +47,9 @@ class Settings(BaseSettings):
     google_api_key: str | None = Field(None, description="Google API key for Gemini LLM")
     anthropic_api_key: str | None = Field(None, description="Anthropic API key for LLM")
     cerebras_api_key: str | None = Field(None, description="Cerebras API key for LLM")
-    cerebras_model: str | None = Field(
-        None,
-        description="Cerebras model name (e.g., llama3.1-8b, gpt-oss-120b). Defaults to gpt-oss-120b",
+    cerebras_model: str = Field(
+        "llama3.1-8b",
+        description="Cerebras model name (e.g., llama3.1-8b, gpt-oss-120b). Defaults to llama3.1-8b for low-latency inference",
     )
     groq_api_key: str | None = Field(None, description="Groq API key for LLM")
     google_application_credentials: str | None = Field(

@@ -50,6 +50,7 @@ from processors.client_manager import ClientConnectionManager
 from processors.configuration import ConfigurationHandler
 from processors.context_manager import DictationContextManager
 from processors.llm_gate import LLMGateFilter
+from processors.thinking_stripper import ThinkingStripper
 from processors.turn_controller import TurnController
 from protocol.messages import (
     SetLLMProviderMessage,
@@ -175,6 +176,7 @@ async def run_pipeline(
     context_manager: DictationContextManager,
     turn_controller: TurnController,
     llm_gate: LLMGateFilter,
+    thinking_stripper: ThinkingStripper,
 ) -> None:
     """Run the Pipecat pipeline for a single WebRTC connection.
 
@@ -185,6 +187,8 @@ async def run_pipeline(
         llm_services: Pre-created LLM services for this connection
         context_manager: Pre-created context manager for this connection
         turn_controller: Pre-created turn controller for this connection
+        llm_gate: Pre-created LLM gate filter for this connection
+        thinking_stripper: Pre-created thinking stripper for this connection
     """
     logger.info("Starting pipeline for new WebRTC connection")
 
@@ -225,6 +229,7 @@ async def run_pipeline(
             llm_gate,  # Gates frames to aggregator based on LLM formatting setting
             context_manager.user_aggregator(),  # Collects transcriptions, emits LLMContextFrame
             llm_switcher,
+            thinking_stripper,  # Strips <think> blocks from CoT models (no-op for normal models)
             context_manager.assistant_aggregator(),  # Collects LLM responses
             transport.output(),
         ]
@@ -552,6 +557,7 @@ async def webrtc_offer(
         context_manager = DictationContextManager()
         turn_controller = TurnController()
         llm_gate = LLMGateFilter()
+        thinking_stripper = ThinkingStripper()
         # Wire up turn controller to context manager for context reset coordination
         turn_controller.set_context_manager(context_manager)
 
@@ -564,6 +570,7 @@ async def webrtc_offer(
                 context_manager=context_manager,
                 turn_controller=turn_controller,
                 llm_gate=llm_gate,
+                thinking_stripper=thinking_stripper,
             )
         )
         services.active_pipeline_tasks.add(task)

@@ -21,6 +21,7 @@ Clean and format raw STT output as professional broadcast text — preserve the 
 
 - When a word sounds like a player name from the active roster, use the correct roster spelling.
 - **When two players have similar-sounding names, use the jersey number or position spoken in context to select the correct player.** If neither is mentioned, preserve the raw STT spelling — do NOT guess.
+- **PRIORITY ORDER: When jersey number, name spelling, and position conflict, resolve using this priority: (1) Jersey number, (2) Position, (3) Name spelling. Jersey number ALWAYS wins — even when the STT confidently outputs a different player's exact name.**
 - Pair a player's name with their jersey number when the announcer includes it (e.g., "number 22 John Smith" → "#22 John Smith").
 
 ## Baseball Announcement Formatting
@@ -70,7 +71,19 @@ Smith lines one into right field and #24 Jon Smyth comes up to make the catch.
 
 ---
 
-### 2. Disambiguating similar names by position
+### 2. Jersey number overrides STT name (CRITICAL)
+
+Input:
+"number 24 John Smith comes up to bat"
+
+WRONG output: #24 John Smith comes up to bat.
+CORRECT output: #24 Jon Smyth comes up to bat.
+
+Why: Jersey #24 = Jon Smyth per roster. The STT incorrectly transcribed "Jon Smyth" as "John Smith" because they sound alike. The jersey number takes priority over name spelling.
+
+---
+
+### 3. Disambiguating similar names by position
 
 Input:
 "the shortstop john smith fields the grounder and throws to first"
@@ -80,7 +93,7 @@ The shortstop John Smith fields the grounder and throws to first.
 
 ---
 
-### 3. Stats and terminology
+### 4. Stats and terminology
 
 Input:
 "judge steps up to the plate he's got a three eighty four oh PS this season uh soto on deck judge swings and drives one deep to left center going going gone a dinger for the big man"
@@ -90,7 +103,7 @@ Judge steps up to the plate. He's got a .384 OPS this season. Soto on deck. Judg
 
 ---
 
-### 4. Score and inning formatting
+### 5. Score and inning formatting
 
 Input:
 "and that's the end of the top of the third yankees lead five to three"

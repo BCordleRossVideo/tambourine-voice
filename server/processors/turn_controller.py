@@ -21,6 +21,7 @@ Uses a state machine pattern with tagged unions for explicit state management:
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -40,8 +41,20 @@ from utils.logger import logger
 if TYPE_CHECKING:
     from processors.context_manager import DictationContextManager
 
-# Default timeout for waiting for STT transcriptions (can be overridden at runtime)
-DEFAULT_TRANSCRIPTION_WAIT_TIMEOUT_SECONDS: Final[float] = 1.5
+# Short timeout for waiting for the VAD speech-stopped signal after stop-recording.
+# If VAD doesn't fire within this window (common when audio stream cuts off immediately),
+# we transition to DrainingState anyway. Keep this short — it's just a grace period.
+DEFAULT_STT_WAIT_TIMEOUT_SECONDS: Final[float] = 0.3
+
+# Adaptive timeout for draining late transcriptions after speech stops.
+# Resets each time a new TranscriptionFrame arrives. This is the user-configurable
+# timeout exposed via the API (controls how long to wait for slow STT providers).
+DEFAULT_DRAINING_TIMEOUT_SECONDS: Final[float] = 0.5
+
+# Minimum word count for a draining-phase transcription to be accepted.
+# Very short transcriptions (1 word) arriving during draining are often garbled
+# audio artifacts from the mic closing. Longer transcriptions are passed through.
+MIN_DRAINING_TRANSCRIPTION_WORDS: Final[int] = 2
 
 
 # =============================================================================
@@ -114,8 +127,12 @@ class TurnController(FrameProcessor):
         self._timeout_task: asyncio.Task[None] | None = None
         self._draining_task: asyncio.Task[None] | None = None
         self._draining_event: asyncio.Event = asyncio.Event()
-        # Configurable timeout for waiting for STT transcriptions (can be updated at runtime)
-        self._transcription_wait_timeout = DEFAULT_TRANSCRIPTION_WAIT_TIMEOUT_SECONDS
+        # Short timeout for waiting for VAD speech-stopped signal (internal, not user-facing)
+        self._stt_wait_timeout = DEFAULT_STT_WAIT_TIMEOUT_SECONDS
+        # Adaptive timeout for draining late transcriptions (user-configurable via API)
+        self._draining_timeout = DEFAULT_DRAINING_TIMEOUT_SECONDS
+        # Timestamp of last transcription received during recording (for garbled detection)
+        self._last_transcription_time: float = 0.0
         # Context manager for reset coordination (set from main.py)
         self._context_manager: DictationContextManager | None = None
 
@@ -128,18 +145,22 @@ class TurnController(FrameProcessor):
         self._context_manager = context_manager
 
     def set_transcription_timeout(self, seconds: float) -> None:
-        """Set the transcription wait timeout.
+        """Set the draining timeout for late transcriptions.
+
+        This controls how long to wait for late-arriving STT transcriptions
+        after speech stops. The adaptive drain resets this timer each time a
+        new transcription arrives.
 
         Args:
-            seconds: Timeout in seconds to wait for STT transcription.
+            seconds: Timeout in seconds to wait for late transcriptions.
                      Increase for slower STT providers.
         """
-        self._transcription_wait_timeout = seconds
-        logger.info(f"Transcription timeout set to {seconds}s")
+        self._draining_timeout = seconds
+        logger.info(f"Draining timeout set to {seconds}s")
 
     def get_transcription_timeout(self) -> float:
-        """Get the current transcription wait timeout."""
-        return self._transcription_wait_timeout
+        """Get the current draining timeout for late transcriptions."""
+        return self._draining_timeout
 
     async def cleanup(self) -> None:
         """Clean up processor resources including internal tasks.
@@ -166,12 +187,13 @@ class TurnController(FrameProcessor):
                 await self.push_frame(frame, direction)
 
             case TranscriptionFrame(text=text) if text:
-                await self._handle_transcription(frame, direction)
-                # Pass transcriptions through during recording states
+                accepted = await self._handle_transcription(frame, direction)
+                # Pass accepted transcriptions through during recording states
                 # LLMGateFilter will decide whether to gate them for the aggregator
-                match self._state:
-                    case RecordingState() | WaitingForSTTState() | DrainingState():
-                        await self.push_frame(frame, direction)
+                if accepted:
+                    match self._state:
+                        case RecordingState() | WaitingForSTTState() | DrainingState():
+                            await self.push_frame(frame, direction)
 
             case _:
                 # Pass through all other frames unchanged
@@ -267,55 +289,88 @@ class TurnController(FrameProcessor):
 
     async def _handle_transcription(
         self, frame: TranscriptionFrame, direction: FrameDirection
-    ) -> None:
-        """Track that content arrived and signal draining if needed."""
+    ) -> bool:
+        """Track that content arrived and signal draining if needed.
+
+        Returns:
+            True if the transcription was accepted, False if it was rejected
+            (e.g., garbled late transcription during draining).
+        """
         _ = direction  # Unused, kept for consistency with other handlers
 
         match self._state:
             case RecordingState():
                 self._state = RecordingState(has_content=True)
+                self._last_transcription_time = time.monotonic()
                 logger.debug(f"Transcription received: '{frame.text}'")
+                return True
 
             case WaitingForSTTState() as state:
                 self._state = WaitingForSTTState(
                     has_content=True,
                     direction=state.direction,
                 )
+                self._last_transcription_time = time.monotonic()
                 logger.info(f"Transcription while waiting: '{frame.text}'")
+                return True
 
             case DrainingState() as state:
+                # Reject likely garbled transcriptions: very short text arriving
+                # during draining is often mic-close artifacts
+                word_count = len(frame.text.split())
+                if word_count < MIN_DRAINING_TRANSCRIPTION_WORDS:
+                    gap_ms = (time.monotonic() - self._last_transcription_time) * 1000
+                    logger.warning(
+                        f"Rejected likely garbled draining transcription "
+                        f"({word_count} words, {gap_ms:.0f}ms gap): '{frame.text}'"
+                    )
+                    return False
+
                 self._state = DrainingState(
                     has_content=True,
                     direction=state.direction,
                 )
+                self._last_transcription_time = time.monotonic()
                 # Signal draining task to reset timeout
                 self._draining_event.set()
                 logger.info(f"Late transcription during draining: '{frame.text}'")
+                return True
 
             case IdleState():
                 logger.warning(f"Transcription while idle: '{frame.text}'")
+                return False
 
     # =========================================================================
     # Timeout Handler
     # =========================================================================
 
     async def _stt_timeout_handler(self, direction: FrameDirection) -> None:
-        """Background task that signals turn end after timeout if speech stopped is not received."""
+        """Background task that transitions to DrainingState after a short VAD grace period.
+
+        The VAD speech-stopped signal often never arrives (e.g., when audio stream
+        cuts off immediately on stop-recording). Instead of waiting the full timeout
+        and ending the turn, we transition to DrainingState to catch any late
+        transcriptions via the adaptive drain.
+        """
         try:
-            await asyncio.sleep(self._transcription_wait_timeout)
+            await asyncio.sleep(self._stt_wait_timeout)
             # Only act if still in WaitingForSTT state
             match self._state:
                 case WaitingForSTTState(has_content=has_content) as state:
-                    logger.warning(
-                        f"Timeout waiting for speech stopped after "
-                        f"{self._transcription_wait_timeout}s"
+                    logger.info(
+                        f"VAD signal not received after {self._stt_wait_timeout}s, "
+                        f"entering draining state (has_content: {has_content})"
                     )
-                    if has_content:
-                        logger.info("Timeout, signaling turn end")
-                        await self._emit_turn_end(state.direction)
-                    else:
-                        await self._emit_empty_response(direction)
-                    self._state = IdleState()
+                    # Transition to DrainingState instead of ending turn directly.
+                    # This ensures late transcriptions are still captured.
+                    self._state = DrainingState(
+                        has_content=has_content,
+                        direction=state.direction,
+                    )
+                    self._draining_event.clear()
+                    self._draining_task = asyncio.create_task(
+                        self._draining_task_handler(direction)
+                    )
                 case _:
                     pass  # State changed, nothing to do
         except asyncio.CancelledError:
@@ -334,18 +389,18 @@ class TurnController(FrameProcessor):
     async def _draining_task_handler(self, direction: FrameDirection) -> None:
         """Wait for late transcriptions with adaptive timeout, then signal turn end.
 
-        Uses an event-based pattern: waits for the transcription timeout, but
+        Uses an event-based pattern: waits for the draining timeout, but
         resets the timer each time a transcription arrives (signaled via
         _draining_event). Signals turn end when the timeout expires with no
         new transcriptions.
 
-        Uses the user-configurable transcription timeout to handle slow STT providers.
+        Uses the user-configurable draining timeout to handle slow STT providers.
         """
         try:
             while True:
                 await asyncio.wait_for(
                     self._draining_event.wait(),
-                    timeout=self._transcription_wait_timeout,
+                    timeout=self._draining_timeout,
                 )
                 # Transcription arrived - clear event and wait again
                 self._draining_event.clear()
